@@ -1067,6 +1067,16 @@ function buildPlayer(type) {
         playerGroup.add(makeMesh(new THREE.SphereGeometry(0.08, 10, 8), matAccent, -0.2, 2.36, 0));
         playerGroup.add(makeMesh(new THREE.SphereGeometry(0.08, 10, 8), matAccent, 0.2, 2.36, 0));
     }
+    // ФИКС: джетпак теперь виден на спине персонажа во время полёта, а не просто
+    // невидимо ускоряет игрока вверх. jetpackVisual создаётся один раз и заново
+    // подвешивается к playerGroup при каждой смене скина (т.к. buildPlayer каждый
+    // раз полностью очищает playerGroup).
+    if (typeof jetpackVisual !== 'undefined') {
+        jetpackVisual.position.set(0, 1.05, 0.32);
+        jetpackVisual.scale.setScalar(0.6);
+        jetpackVisual.visible = state.bonusJetpack > 0;
+        playerGroup.add(jetpackVisual);
+    }
 }
 function applySkin(skinId) {
     const skin = SKINS.find(s => s.id === skinId) || SKINS[0];
@@ -1273,6 +1283,9 @@ function buildJetpackMesh() {
     g.add(flameR);
     return g;
 }
+// ФИКС: единственный экземпляр джетпака для отображения на спине персонажа во время полёта
+const jetpackVisual = buildJetpackMesh();
+jetpackVisual.visible = false;
 
 const bonusBuilders = {
     shield: buildShieldMesh,
@@ -1317,15 +1330,17 @@ const LANES = [-3, 0, 3];
 const GRAVITY = 35;
 const JUMP_VELOCITY = 12;
 const MAX_FALL = 25;
+// ФИКС: скорость быстрого падения при нажатии "вниз" в воздухе (кувырок как в Subway Surfers)
+const FAST_FALL_SPEED = 42;
 
 const state = {
     playing:false, paused:false, over:false, inMenu:true,
-    score:0, coinsThisRun:0, baseSpeed:9,
+    score:0, coinsThisRun:0, baseSpeed:9, runTime:0,
     zoneThreshold:100, nextZoneAt:100,
     currentLane:1, playerX:0, targetX:0,
     playerY:0, vy:0, onGround:true,
     jumpBuffer:0, coyoteTime:6,
-    rolling:false, rollTimer:0,
+    rolling:false, rollTimer:0, fastFalling:false,
     invuln:0,
     obstacles:[], coins:[], bonuses:[], platforms:[],
     spawnTimer:0, coinTimer:0, bonusTimer:0, platformTimer:0,
@@ -1382,8 +1397,13 @@ function spawnCoinLine(lane, y, count) {
 }
 function spawnCoin() {
     const lane = randLane();
+    // ФИКС: раньше монетки всегда спавнились на высоте бега (y=1.2), даже когда игрок
+    // летел на джетпаке высоко над землёй — часть монеток было физически не поймать.
+    // Теперь во время полёта монетки появляются на высоте полёта, а во время бега —
+    // как обычно, на уровне земли (никаких монеток "вверху", когда персонаж бежит).
+    const y = state.bonusJetpack > 0 ? Math.max(4.4, Math.min(5.6, state.playerY)) + (Math.random() * 0.4 - 0.2) : 1.2;
     const coin = new THREE.Mesh(coinGeo, coinMat);
-    coin.position.set(LANES[lane], 1.2, -95);
+    coin.position.set(LANES[lane], y, -95);
     coin.castShadow = true; coin.userData = { collected:false };
     scene.add(coin); state.coins.push(coin);
 }
@@ -1455,17 +1475,24 @@ function damageBoss() {
 // ============ УПРАВЛЕНИЕ ============
 function moveLane(dir) {
     if (!state.playing || state.over || state.paused) return;
-    if (state.rolling) return;
+    // ФИКС: раньше во время кувырка нельзя было сменить полосу — теперь можно,
+    // как в Subway Surfers.
     const n = state.currentLane + dir;
     if (n >= 0 && n <= 2) { state.currentLane = n; state.targetX = LANES[n]; }
 }
 function jump() { if (!state.playing || state.over || state.paused || state.rolling) return; state.jumpBuffer = 8; }
 function roll() {
     if (!state.playing || state.over || state.paused) return;
-    if (!state.onGround || state.rolling) return;
-    state.rolling = true; state.rollTimer = 30;
-    save.rolls = (save.rolls || 0) + 1; debouncedLocalSave(); checkAchievements();
-    audio.sfxJump();
+    if (state.rolling || state.fastFalling) return;
+    if (state.onGround) {
+        state.rolling = true; state.rollTimer = 30;
+        save.rolls = (save.rolls || 0) + 1; debouncedLocalSave(); checkAchievements();
+        audio.sfxJump();
+    } else {
+        // ФИКС: нажатие "вниз" в прыжке — персонаж быстро падает вниз и после
+        // приземления сразу уходит в кувырок, как в Subway Surfers.
+        state.fastFalling = true;
+    }
 }
 document.addEventListener('keydown', e => {
     if (!state.playing) return;
@@ -1686,16 +1713,40 @@ function update(dt) {
         state.vy = jv; state.onGround = false; state.coyoteTime = 0; state.jumpBuffer = 0;
         audio.sfxJump();
     }
+    jetpackVisual.visible = state.bonusJetpack > 0;
     if (state.bonusJetpack > 0) {
         if (state.playerY < 5.5) state.vy = 3; else state.vy = Math.max(state.vy - 8 * dt, 0);
         state.onGround = false;
+        state.fastFalling = false;
+        // ФИКС: джетпак виден на спине и оставляет дымный след, пока персонаж летит
+        state.jetpackSmokeTimer = (state.jetpackSmokeTimer || 0) + dt;
+        if (state.jetpackSmokeTimer > 0.04) {
+            state.jetpackSmokeTimer = 0;
+            const smokeColor = Math.random() < 0.5 ? 0xcccccc : 0x999999;
+            emitParticles(state.playerX - 0.2, state.playerY + 0.55, 0.35, smokeColor, 1);
+            emitParticles(state.playerX + 0.2, state.playerY + 0.55, 0.35, smokeColor, 1);
+        }
     } else if (!state.onGround) {
-        state.vy -= GRAVITY * dt;
-        if (state.vy < -MAX_FALL) state.vy = -MAX_FALL;
+        if (state.fastFalling) {
+            // ФИКС: держим высокую постоянную скорость падения, а не обычную гравитацию
+            state.vy = -FAST_FALL_SPEED;
+        } else {
+            state.vy -= GRAVITY * dt;
+            if (state.vy < -MAX_FALL) state.vy = -MAX_FALL;
+        }
     }
     if (!state.onGround) {
         state.playerY += state.vy * dt;
-        if (state.playerY <= supportY) { state.playerY = supportY; state.vy = 0; state.onGround = true; }
+        if (state.playerY <= supportY) {
+            state.playerY = supportY; state.vy = 0; state.onGround = true;
+            if (state.fastFalling) {
+                // ФИКС: приземление после быстрого падения сразу переходит в кувырок
+                state.fastFalling = false;
+                state.rolling = true; state.rollTimer = 30;
+                save.rolls = (save.rolls || 0) + 1; debouncedLocalSave(); checkAchievements();
+                audio.sfxJump();
+            }
+        }
     } else {
         state.coyoteTime = 6;
         if (state.playerY > supportY + 0.05) state.onGround = false;
@@ -1731,15 +1782,29 @@ function update(dt) {
         if (playerParts.head) playerParts.head.position.y = 1.72 + off;
     } else {
         playerGroup.scale.set(1, 1, 1);
-        playerGroup.rotation.x = 0;
         playerGroup.position.x = state.playerX;
         playerGroup.position.y = state.playerY;
         playerGroup.position.z = 0;
-        if (playerParts.legL) playerParts.legL.rotation.x = -0.3;
-        if (playerParts.legR) playerParts.legR.rotation.x = 0.3;
-        if (playerParts.armL) playerParts.armL.rotation.x = -1.2;
-        if (playerParts.armR) playerParts.armR.rotation.x = -1.2;
+        if (state.fastFalling) {
+            // ФИКС: поза "ныряния" при быстром падении вниз
+            playerGroup.rotation.x = 0.55;
+            if (playerParts.legL) playerParts.legL.rotation.x = 0.25;
+            if (playerParts.legR) playerParts.legR.rotation.x = 0.25;
+            if (playerParts.armL) playerParts.armL.rotation.x = -0.5;
+            if (playerParts.armR) playerParts.armR.rotation.x = -0.5;
+        } else {
+            playerGroup.rotation.x = 0;
+            if (playerParts.legL) playerParts.legL.rotation.x = -0.3;
+            if (playerParts.legR) playerParts.legR.rotation.x = 0.3;
+            if (playerParts.armL) playerParts.armL.rotation.x = -1.2;
+            if (playerParts.armR) playerParts.armR.rotation.x = -1.2;
+        }
     }
+
+    // ОПТИМИЗАЦИЯ/УЛУЧШЕНИЕ: лёгкий наклон персонажа в сторону смены полосы —
+    // добавляет "живости" движению при перестроении влево/вправо.
+    const leanTarget = Math.max(-0.3, Math.min(0.3, (state.targetX - state.playerX) * 0.5));
+    playerGroup.rotation.z += (leanTarget - playerGroup.rotation.z) * Math.min(1, 10 * dt);
 
     const modeMul = getCurrentMode().speedMul;
     const effectiveSpeed = state.baseSpeed * modeMul;
@@ -1820,8 +1885,14 @@ function update(dt) {
 
     updateParticles(dt);
 
+    state.runTime += dt;
     state.spawnTimer += dt;
-    if (state.spawnTimer > 0.85) { state.spawnTimer = 0; spawnObstaclePattern(); }
+    // ФИКС: в первые секунды забега препятствия спавнились в обычном темпе, но так как
+    // скорость мира в начале ниже, первое препятствие доезжало до игрока слишком долго —
+    // ощущалось как "пустая карта". Первые 8 секунд спавним препятствия чаще, чтобы
+    // сразу заполнить начальный отрезок трассы.
+    const spawnThreshold = state.runTime < 8 ? 0.45 : 0.85;
+    if (state.spawnTimer > spawnThreshold) { state.spawnTimer = 0; spawnObstaclePattern(); }
     state.coinTimer += dt;
     if (state.coinTimer > 0.7) { state.coinTimer = 0; spawnCoin(); }
     if (state.bonusJetpack > 0 && Math.random() < 0.06) spawnJetpackRing();
@@ -2099,7 +2170,7 @@ function startGame() {
     clearWorld();
     state.inMenu = false;
     state.playing = true; state.paused = false; state.over = false;
-    state.score = 0; state.coinsThisRun = 0; state.baseSpeed = 9;
+    state.score = 0; state.coinsThisRun = 0; state.baseSpeed = 9; state.runTime = 0;
     state.currentLane = 1; state.playerX = 0; state.targetX = 0;
     state.playerY = 0; state.vy = 0; state.onGround = true;
     state.spawnTimer = 0.4; state.coinTimer = 0; state.bonusTimer = 0; state.platformTimer = 0;
@@ -2107,7 +2178,7 @@ function startGame() {
     state.bonusShield = 0; state.bonusMagnet = 0; state.bonusSneakers = 0; state.bonusJetpack = 0;
     state.reviveUsed = false; state.doubleCoinsUsed = false;
     state.jumpBuffer = 0; state.coyoteTime = 6;
-    state.rolling = false; state.rollTimer = 0;
+    state.rolling = false; state.rollTimer = 0; state.fastFalling = false;
     state.walkCycle = 0;
     state.bossNextAt = 400;
     state.cameraSpecialActive = false; state.cameraSpecialTimer = 0;
@@ -2159,7 +2230,7 @@ function revivePlayer() {
     state.reviveUsed = true; state.over = false; state.playing = true;
     state.invuln = 120;
     state.playerY = 0; state.vy = 0; state.onGround = true;
-    state.rolling = false; state.rollTimer = 0;
+    state.rolling = false; state.rollTimer = 0; state.fastFalling = false;
     state.jumpBuffer = 0; state.coyoteTime = 6;
     playerGroup.rotation.x = 0;
     playerGroup.position.z = 0;
