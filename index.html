@@ -1144,6 +1144,33 @@ function buildConcreteBlock() {
     g.add(makeMesh(GEO.concreteStripe, MAT.concreteStripe, 0, 0.52, 0));
     return g;
 }
+// ФИКС: воздушное препятствие — подвешенная балка с тросами, которую нужно облетать
+// сменой полосы во время полёта на джетпаке.
+function buildAirObstacle() {
+    const g = new THREE.Group();
+    const beamMat = new THREE.MeshStandardMaterial({ color: 0xe94560, roughness: .5, metalness: .3 });
+    const stripeMat = new THREE.MeshStandardMaterial({ color: 0xffd700, roughness: .5, metalness: .3 });
+    const cableMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: .8 });
+    const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 2.6, 12), beamMat);
+    beam.rotation.z = Math.PI / 2;
+    g.add(beam);
+    for (let i = -1; i <= 1; i++) {
+        const stripe = new THREE.Mesh(new THREE.CylinderGeometry(0.23, 0.23, 0.3, 12), stripeMat);
+        stripe.rotation.z = Math.PI / 2;
+        stripe.position.x = i * 0.8;
+        g.add(stripe);
+    }
+    [-1.15, 1.15].forEach(x => {
+        const cable = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 2.4, 6), cableMat);
+        cable.position.set(x, 1.25, 0);
+        g.add(cable);
+    });
+    const light = new THREE.Mesh(new THREE.SphereGeometry(0.11, 8, 8), new THREE.MeshBasicMaterial({ color: 0xff2222 }));
+    light.position.set(0, -0.32, 0);
+    g.add(light);
+    g.traverse(m => { if (m.isMesh) { m.castShadow = true; m.receiveShadow = true; } });
+    return g;
+}
 
 // ============ ПУЛ ЧАСТИЦ ============
 const PARTICLE_POOL_SIZE = 60;
@@ -1343,7 +1370,7 @@ const state = {
     rolling:false, rollTimer:0, fastFalling:false,
     invuln:0,
     obstacles:[], coins:[], bonuses:[], platforms:[],
-    spawnTimer:0, coinTimer:0, bonusTimer:0, platformTimer:0,
+    spawnTimer:0, coinTimer:0, bonusTimer:0, platformTimer:0, airObstacleTimer:0,
     bonusShield:0, bonusMagnet:0, bonusSneakers:0, bonusJetpack:0,
     reviveUsed:false, doubleCoinsUsed:false,
     walkCycle:0,
@@ -1363,29 +1390,60 @@ function getCurrentMode() { return MODES.find(m => m.id === state.mode) || MODES
 function randLane() { return Math.floor(Math.random() * 3); }
 function shuffle(a) { return a.slice().sort(() => Math.random() - .5); }
 function pickType() { const r = Math.random(); if (r < 0.45) return 'low'; if (r < 0.75) return 'overhead'; return 'wall'; }
-function placeObstacle(lane, type) {
+function placeObstacle(lane, type, y) {
     let mesh;
     if (type === 'low')      mesh = Math.random() < 0.5 ? buildTrashCan() : buildTires();
     else if (type === 'overhead') mesh = buildRoadSignObstacle();
+    else if (type === 'air') mesh = buildAirObstacle();
     else {
         const r = Math.random();
         if (r < 0.4) mesh = buildTruck(); else if (r < 0.7) mesh = buildBarrier(); else mesh = buildConcreteBlock();
     }
-    mesh.position.set(LANES[lane], 0, -95);
+    mesh.position.set(LANES[lane], y !== undefined ? y : 0, -95);
     mesh.userData = { type, lane };
     scene.add(mesh); state.obstacles.push(mesh);
 }
 function spawnObstaclePattern() {
-    const patterns = [
-        () => placeObstacle(randLane(), pickType()),
-        () => shuffle([0,1,2]).slice(0, 2).forEach(l => placeObstacle(l, pickType())),
-        () => { const lane = randLane(); placeObstacle(lane, pickType()); spawnCoinLine([0,1,2].filter(l => l !== lane)[0], 1.2, 3); },
-        () => { const lanes = shuffle([0,1,2]).slice(0, 2); placeObstacle(lanes[0], 'low'); spawnCoinLine(lanes[1], 1.2, 5); },
-        () => {},
-        () => { const lane = randLane(); placeObstacle(lane, 'overhead'); spawnCoinLine(shuffle([0,1,2]).filter(l => l !== lane)[0], 1.2, 4); },
-        () => { const startLane = randLane(); placeObstacle(startLane, pickType()); if (startLane < 2) placeObstacle(startLane + 1, pickType()); else placeObstacle(startLane - 1, pickType()); },
-    ];
-    patterns[Math.floor(Math.random() * patterns.length)]();
+    // ФИКС: раньше линии препятствий выбирались независимо друг от друга — иногда все
+    // 3 линии оказывались перекрыты непроходимыми "стенами", а монетки могли стоять
+    // за препятствием, до которого невозможно добраться. Теперь генерация всегда
+    // гарантирует хотя бы один проходимый путь, а монетки ставятся только туда,
+    // куда реально можно добежать/допрыгнуть (как в Subway Surfers).
+    const r = Math.random();
+    const laneCount = r < 0.12 ? 0 : r < 0.45 ? 1 : r < 0.8 ? 2 : 3;
+    if (laneCount === 0) return; // короткая передышка без препятствий
+    const lanes = shuffle([0, 1, 2]).slice(0, laneCount);
+    const types = lanes.map(() => pickType());
+    if (lanes.length === 3) {
+        // Гарантия: если заняты все 3 линии — хотя бы одна должна быть проходимой
+        const wallIdx = types.map((t, i) => t === 'wall' ? i : -1).filter(i => i >= 0);
+        if (wallIdx.length === 3) {
+            types[wallIdx[Math.floor(Math.random() * wallIdx.length)]] = Math.random() < 0.5 ? 'low' : 'overhead';
+        }
+    }
+    lanes.forEach((lane, i) => placeObstacle(lane, types[i]));
+
+    const freeLanes = [0, 1, 2].filter(l => !lanes.includes(l));
+    if (freeLanes.length) {
+        // Свободная линия — монетки на уровне бега, ведут игрока по безопасному пути
+        const lane = freeLanes[Math.floor(Math.random() * freeLanes.length)];
+        spawnCoinLine(lane, 1.2, 3 + Math.floor(Math.random() * 3));
+    } else {
+        // Все линии заняты — монетки только над/под ПРОХОДИМЫМ препятствием
+        const passableIdx = types.findIndex(t => t !== 'wall');
+        if (passableIdx >= 0) {
+            const y = types[passableIdx] === 'overhead' ? 0.4 : 1.9;
+            spawnCoinLine(lanes[passableIdx], y, 3);
+        }
+    }
+}
+function spawnAirObstacles() {
+    // ФИКС: воздушные препятствия во время полёта на джетпаке — нужно облетать их
+    // сменой полосы. Никогда не занимают все 3 линии — проход всегда есть.
+    const laneCount = Math.random() < 0.5 ? 1 : 2;
+    const lanes = shuffle([0, 1, 2]).slice(0, laneCount);
+    const y = Math.max(4.3, Math.min(5.7, state.playerY));
+    lanes.forEach(lane => placeObstacle(lane, 'air', y));
 }
 function spawnCoinLine(lane, y, count) {
     for (let i = 0; i < count; i++) {
@@ -1573,6 +1631,7 @@ function checkCollisions() {
         let oTop, oBot;
         if (obs.userData.type === 'low')           { oTop = 1.4; oBot = 0; }
         else if (obs.userData.type === 'overhead') { oTop = 3.2; oBot = 1.5; }
+        else if (obs.userData.type === 'air')      { oTop = obs.position.y + 1.0; oBot = obs.position.y - 1.0; }
         else                                        { oTop = 3.0; oBot = 0; }
         if (pTop > oBot && pBot < oTop) {
             if (state.invuln > 0) continue;
@@ -1694,7 +1753,9 @@ function update(dt) {
         if (state.timeLeft <= 0) { gameOver(); return; }
     }
 
-    state.playerX += (state.targetX - state.playerX) * Math.min(1, 18 * dt);
+    // ФИКС: увеличена скорость смены полосы — персонаж перемещается в сторону
+    // быстрее и без ощутимой задержки после нажатия
+    state.playerX += (state.targetX - state.playerX) * Math.min(1, 32 * dt);
 
     let supportY = 0;
     for (const p of state.platforms) {
@@ -1715,7 +1776,11 @@ function update(dt) {
     }
     jetpackVisual.visible = state.bonusJetpack > 0;
     if (state.bonusJetpack > 0) {
-        if (state.playerY < 5.5) state.vy = 3; else state.vy = Math.max(state.vy - 8 * dt, 0);
+        // ФИКС: взлёт на джетпаке был слишком плавным (vy=3 → долгий подъём).
+        // Теперь резкий быстрый взлёт, а по достижении высоты полёта — чёткая
+        // фиксация на высоте парения (без проскакивания вверх).
+        if (state.playerY < 5.5) { state.vy = 16; }
+        else { state.vy = 0; state.playerY = 5.5; }
         state.onGround = false;
         state.fastFalling = false;
         // ФИКС: джетпак виден на спине и оставляет дымный след, пока персонаж летит
@@ -1753,15 +1818,14 @@ function update(dt) {
         else state.playerY = supportY;
     }
 
-    // ФИКС #3: кувырок с сжатием (tuck) — голова не проваливается
+    // Кувырок (tuck) — персонаж не уменьшается в размере во время кувырка
     if (state.rolling) {
         const t = (30 - state.rollTimer) / 30;
         const a = t * Math.PI * 2;
-        const sc = 1 - 0.4 * Math.sin(t * Math.PI);
         const lift = 0.15 * Math.sin(t * Math.PI);
-        playerGroup.scale.set(sc, sc, sc);
+        playerGroup.scale.set(1, 1, 1);
         playerGroup.rotation.x = -a;
-        const pivot = 0.9 * sc;
+        const pivot = 0.7;
         playerGroup.position.x = state.playerX;
         playerGroup.position.y = state.playerY + pivot * (1 - Math.cos(a)) + lift;
         playerGroup.position.z = pivot * Math.sin(a);
@@ -1887,15 +1951,20 @@ function update(dt) {
 
     state.runTime += dt;
     state.spawnTimer += dt;
-    // ФИКС: в первые секунды забега препятствия спавнились в обычном темпе, но так как
-    // скорость мира в начале ниже, первое препятствие доезжало до игрока слишком долго —
-    // ощущалось как "пустая карта". Первые 8 секунд спавним препятствия чаще, чтобы
-    // сразу заполнить начальный отрезок трассы.
-    const spawnThreshold = state.runTime < 8 ? 0.45 : 0.85;
-    if (state.spawnTimer > spawnThreshold) { state.spawnTimer = 0; spawnObstaclePattern(); }
+    // ФИКС: раньше в начале забега интервал спавна укорачивался (0.45с), но при низкой
+    // стартовой скорости это давало слишком маленькое расстояние между волнами препятствий
+    // (~4 юнита) — они "наваливались" друг на друга. Теперь интервал спавна всегда одинаковый
+    // и безопасный, а пустая трасса в начале решается предварительной расстановкой волн
+    // в startGame() (см. ниже), а не учащением спавна.
+    if (state.spawnTimer > 0.85) { state.spawnTimer = 0; spawnObstaclePattern(); }
     state.coinTimer += dt;
     if (state.coinTimer > 0.7) { state.coinTimer = 0; spawnCoin(); }
-    if (state.bonusJetpack > 0 && Math.random() < 0.06) spawnJetpackRing();
+    if (state.bonusJetpack > 0) {
+        if (Math.random() < 0.06) spawnJetpackRing();
+        // ФИКС: воздушные препятствия появляются только во время полёта на джетпаке
+        state.airObstacleTimer = (state.airObstacleTimer || 0) + dt;
+        if (state.airObstacleTimer > 1.3) { state.airObstacleTimer = 0; spawnAirObstacles(); }
+    }
     state.bonusTimer += dt;
     if (state.bonusTimer > 10) { state.bonusTimer = 0; if (Math.random() < .5) spawnBonus(); }
     state.platformTimer += dt;
